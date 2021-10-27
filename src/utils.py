@@ -15,6 +15,8 @@ from random_walks import RandomWalk
 def parse_args():
     parser = argparse.ArgumentParser()
 
+    parser.add_argument('--regloss', type=bool, default=False)
+    parser.add_argument('--att_vis', type=bool, default=False)
     parser.add_argument('--input', type=str, default='../data/amazon_processed',
                         help='Input dataset path')
 
@@ -166,9 +168,9 @@ def get_Gs_from_edges(graph_by_type):
 
 def load_training_data(f_name):
     print('We are loading data from:', f_name)
-    graphs = set()
-    type_reid = dict()
-    edge_data_by_type = dict()
+    graphs = set()  # 所有边的集合 set((node1, node2))
+    type_reid = dict()  # 对edge type重新编号 dict{edge_type:id}
+    edge_data_by_type = dict()  # dict{edge_type:[(ndoe1, node2)]}
     all_nodes = list()
     with open(f_name, 'r') as f:
         for line in f:
