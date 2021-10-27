@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import tqdm
 from numpy import random
 from torch.nn.parameter import Parameter
-from model import MetaGraphSager, HybridGNN
+from model import MetaGraphSager, HybridGNN, RegLoss
 from utils import *
 from hybrid_sample import prepare_samples
 import copy
@@ -231,11 +231,11 @@ def train_model(graph, graph_by_type, args):
                          'num_nodes': num_nodes,
                          'index2word': index2word}, f)
     edgetypes = [i for i in range(args.edge_type_count)]
-
     model = HybridGNN(max_users=num_nodes, edge_type_count=args.edge_type_count, schema=args.schema, edge_dim=args.edge_dim,
-                      input_dim=args.dimensions, output_dim=args.dimensions, random_layer=args.random_sample_layers)
+                      input_dim=args.dimensions, output_dim=args.dimensions, random_layer=args.random_sample_layers, att_vis=args.att_vis)
 
     nsloss = NSLoss(num_nodes, args.negative_samples, device, args.dimensions)
+    regloss = RegLoss(decay=0.01)
 
     model.to(device)
     nsloss.to(device)
@@ -269,9 +269,12 @@ def train_model(graph, graph_by_type, args):
             nodeid, connid, typeid, meta_neigh, rand_neigh = data
             optimizer.zero_grad()
             rows = torch.tensor([i for i in range(len(nodeid))]).long().to(device)
-            embs = model(nodeid.to(device), (rows, typeid.to(device)),
-                         meta_neigh.to(device), rand_neigh.to(device))
+            embs, att_scores = model(nodeid.to(device), (rows, typeid.to(device)),
+                         meta_neigh.to(device), rand_neigh.to(device))  #emb [N, dim] att_score [N, n_head, edge_type_cnt+1, schema_num, schema_num]
             loss = nsloss(nodeid.to(device), embs, connid.to(device))
+
+            if args.regloss == True:
+                loss += regloss(embs)
             loss.backward()
             optimizer.step()
 
@@ -287,9 +290,10 @@ def train_model(graph, graph_by_type, args):
                 data_iter.write(str(post_fix))
 
         final_model = dict(zip(edgetypes, [dict() for _ in range(args.edge_type_count)]))
+        final_att_score = dict()  # key (nodeid, typeid) value 该节点在每个关系、每个schema上的att score[edge_type_cnt, n_head, schema_num, schema_num]，与typeid无关
         for i in range(len(all_nodes)):
-            train_inputs = torch.tensor([i for _ in range(args.edge_type_count)]).long().to(device)
-            train_types = torch.tensor(list(range(args.edge_type_count))).long().to(device)
+            train_inputs = torch.tensor([i for _ in range(args.edge_type_count)]).long().to(device)  # [i,i,i]
+            train_types = torch.tensor(list(range(args.edge_type_count))).long().to(device)  # [0,1,2]
             node_neigh = []
             for j in range(len(edgetypes)):
                 key = (i, j)
@@ -303,11 +307,15 @@ def train_model(graph, graph_by_type, args):
             ).long().to(device)
             rows = torch.tensor([i for i in range(train_inputs.size(0))]).long().to(device)
             # node_emb = model(train_inputs, (rows, train_types), node_neigh)
-            node_emb = model(train_inputs, (rows, train_types), node_neigh, rand_node_neigh)
+            node_emb, node_att_scores = model(train_inputs, (rows, train_types), node_neigh, rand_node_neigh)  # [3, dim] [3,edge_type_cnt, n_head,schema_num+1, schema_num+1]
             for j in range(args.edge_type_count):
                 final_model[edgetypes[j]][index2word[i]] = (
                     node_emb[j].cpu().detach().numpy()
                 )
+            if node_att_scores is not None:
+                for j in range(len(edgetypes)):
+                    final_att_score[(index2word[i], j)] = node_att_scores[j].cpu().detach().numpy()
+
 
         valid_aucs, valid_f1s, valid_prs = [], [], []
         test_aucs, test_f1s, test_prs = [], [], []
@@ -352,8 +360,22 @@ def train_model(graph, graph_by_type, args):
             best_avg_f1 = np.mean(valid_f1s)
             best_score = cur_score
             patience = 0
-            torch.save(copy.deepcopy(model.state_dict()), model.name + "_" + args.input.split("/")[-1] + + '.chkpt')
-            model.load_state_dict(torch.load(model.name + "_" + args.input.split("/")[-1] + '.chkpt'))
+            # torch.save(copy.deepcopy(model.state_dict()), model.name + "_" + args.input.split("/")[-1] + '.chkpt')
+            # model.load_state_dict(torch.load(model.name + "_" + args.input.split("/")[-1] + '.chkpt'))
+            # add
+            if args.regloss == True:
+                with open(model.name + '_' + 'bst_' + args.input.split("/")[-1] + '_reg' + '.pkl', 'wb') as f:
+                    pickle.dump(final_model, f)
+            else:
+                print('Saving bst model...')
+                save_bstmodel(model, final_model, args.input.split("/")[-1])
+                if len(final_att_score.keys()) != 0:
+                    # saving att score.
+                    print('Saving att score...')
+                    save_att_score('att_score_' + args.input.split("/")[-1] + '.txt', final_att_score, schemas)
+                    with open('att_score_' + args.input.split("/")[-1] + '.pkl', 'wb') as f:
+                        pickle.dump(final_att_score, f)
+
         else:
             patience += 1
             if patience > args.patience:
@@ -369,6 +391,23 @@ def train_model(graph, graph_by_type, args):
     return average_auc, average_f1, average_pr
 
 
+def save_att_score(filename, final_att_score, schema, head_idx=0):
+    """
+    :param filename:
+    :param final_att_score: dict{(nodeid, typeid):ndarray[edge_type_cnt+1, n_head, schema_num, schema_num]}
+    :param schema: str
+    :param head_idx: 保存第几个head的结果
+    :return:
+    """
+    with open(filename, 'w') as f:
+        f.write('schema: ' + schema + '\n')
+        for (nodeid, typeid) in final_att_score.keys():
+            att_score = final_att_score[(nodeid, typeid)][:, head_idx, :, :]  # 取第head_idx的结果
+            for edge_type in range(att_score.shape[0]):
+                f.write(str(nodeid) + ' ' + str(typeid) + ' ' + str(edge_type) + '\n')
+                f.write(str(att_score[edge_type, :, :]) + '\n')
+
+
 def load_node_type(filename):
     with open(filename, 'r', encoding='utf-8') as f:
         data = f.readlines()
@@ -378,6 +417,15 @@ def load_node_type(filename):
         nodetype[int(nodeid)] = str(typeid)
     return nodetype
 
+def save_bstmodel(model, final_dict, dataset):
+    """
+    :param model:
+    :param final_dict: final_model, dict{1:{1:emb1}}
+    :param dataset: dataset name, IMDB
+    :return:
+    """
+    with open(model.name + '_' + 'bst_' + dataset + '.pkl', 'wb') as f:
+        pickle.dump(final_dict, f)
 
 if __name__ == "__main__":
     args = parse_args()
@@ -387,7 +435,7 @@ if __name__ == "__main__":
     # preprocess
     schemas = args.schema.replace(' ', '')
 
-    training_graphs, training_data_by_type = load_training_data(file_name + "/train.txt")
+    training_graphs, training_data_by_type = load_training_data(file_name + "/train.txt")  # 所有边集合set((node1, node2))
     valid_true_data_by_edge, valid_false_data_by_edge = load_testing_data(
         file_name + "/valid.txt"
     )
