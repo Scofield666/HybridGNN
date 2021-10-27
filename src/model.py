@@ -186,6 +186,14 @@ class MultiHeadAttention(nn.Module):
         return q, attn
 
 
+class RegLoss():
+    def __init__(self, decay):
+        self.decay = decay
+
+    def __call__(self, embedding):
+        return self.decay * torch.mean(embedding.pow(2))
+
+
 class NSLoss(nn.Module):
     def __init__(self, num_nodes, num_sampled, device, embedding_size=200):
         super(NSLoss, self).__init__()
@@ -471,7 +479,7 @@ class HybridGNN(nn.Module):
     '''
 
     def __init__(self, max_users, edge_type_count, schema=None, edge_dim=100, input_dim=200, output_dim=200,
-                 random_layer=3):
+                 random_layer=3, att_vis=False):
         super(HybridGNN, self).__init__()
         # Param
         self.alpha = 0.1
@@ -483,6 +491,7 @@ class HybridGNN(nn.Module):
         self.partition_list = self.get_partition_list()
         self.random_partition_list = self.get_random_partition_list(random_layer)
         self.random_sample_layer = random_layer
+        self.att_vis = att_vis
 
         # hybrid mixture
         self.node_type_embeddings = nn.Parameter(
@@ -587,27 +596,47 @@ class HybridGNN(nn.Module):
             for agg_layer in self.random_agg_layer.children():
                 all_feats = [agg_layer(all_feats[k], all_feats[k + 1]) for k in range(len(all_feats) - 1)]
             assert len(all_feats) == 1, "asseration len(all_feats) == 1"
-            random_view = all_feats[0].unsqueeze(dim=1)
-
-            meta_view = [torch.cat([view, random_view], dim=1) for view in meta_view]
+            random_view = all_feats[0].unsqueeze(dim=1)  # [N, 1, dim]
+            # -------------------------------------- modify --------------------------------------#
+            # meta_view = [torch.cat([view, random_view], dim=1) for view in meta_view]
+            # -------------------------------------- modify --------------------------------------#
+            meta_view = torch.stack(meta_view, dim=1)  # [N, schema_num, edge_type_cnt, dim]
+            random_view = random_view.repeat(1, meta_view.size(2), 1).unsqueeze(1)  # [N, 1, edge_type_cnt, dim]
+            meta_view = torch.cat((meta_view, random_view), dim=1)  # [N, schema_num+1, edge_type_cnt, dim]
+            meta_view = [meta_view[:, meta_id, :, :] for meta_id in range(meta_view.size(1))]  # list[tensor[], tensor[]] tensor shape:[N, edge_type_cnt, dim]
             # radnom hybrid end
 
         # self attention on type
         meta_view = [self.slf_view_attn(view, view, view)[0] for view in meta_view]
-        meta_view = torch.stack(meta_view, dim=1)  # batch * meta * type * embed embeding
-        # type embedding
-        # self attention on meta; [] len: typeid, batch * meta * embed
-        meta_view = [self.slf_meta_attn(meta_view[:, :, typeid, :],
-                                        meta_view[:, :, typeid, :],
-                                        meta_view[:, :, typeid, :])[0] for typeid in range(meta_view.size(2))]
-        meta_view = torch.stack(meta_view, dim=2)  # batch * meta * type * embed
+        meta_view = torch.stack(meta_view, dim=1)  # batch * meta * type * embed embeding  [N, schema_num+1, edge_type_cnt, dim]
+        # # type embedding
+        # # self attention on meta; [] len: typeid, batch * meta * embed
+        # meta_view = [self.slf_meta_attn(meta_view[:, :, typeid, :],
+        #                                 meta_view[:, :, typeid, :],
+        #                                 meta_view[:, :, typeid, :])[0] for typeid in range(meta_view.size(2))]
+        # meta_view = torch.stack(meta_view, dim=2)  # batch * meta * type * embed
+
+        # ----------------------- attention score visualization ----------------------- #
+        meta_view_att_scores = []
+        meta_view_tmp = []
+        for typeid in range(meta_view.size(2)):
+            att_res, att_score = self.slf_meta_attn(meta_view[:, :, typeid, :],
+                                                    meta_view[:, :, typeid, :],
+                                                    meta_view[:, :, typeid, :])  # res:[N, schema_num+1, dim]  att_score [N, n_head, schema_num+1, schema_num+1]
+            meta_view_att_scores.append(att_score)
+            meta_view_tmp.append(att_res)
+        meta_view = torch.stack(meta_view_tmp, dim=2)  # [N, schema_num+1, edge_type_cnt, dim]
+        meta_view_att_scores = torch.stack(meta_view_att_scores, dim=1)  # [N, edge_type_cnt, n_head, schema_num+1, schema_num+1]
 
         # batch * embed
         # out_embed = torch.matmul(meta_view[edgetype[0], metatype, edgetype[1]].unsqueeze(dim=1),
         #                          self.reflect[metatype, edgetype[1]]).squeeze(dim=1)
         out_embed = torch.matmul(torch.mean(meta_view, dim=1)[edgetype[0], edgetype[1]].unsqueeze(dim=1),
                                  self.reflect[edgetype[1]]).squeeze(dim=1)
-        return F.normalize(base_embedding + out_embed, dim=1)
+        if self.att_vis == True:
+            return F.normalize(base_embedding + out_embed, dim=1), meta_view_att_scores
+        else:
+            return F.normalize(base_embedding + out_embed, dim=1), None
 
 
 class SuperHybridGNN(nn.Module):
